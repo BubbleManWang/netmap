@@ -73,6 +73,22 @@
 
 /* ======================== FREEBSD-SPECIFIC ROUTINES ================== */
 
+void nm_os_selinfo_init(NM_SELINFO_T *si) {
+	struct mtx *m = &si->m;
+	mtx_init(m, "nm_kn_lock", NULL, MTX_DEF);
+	knlist_init_mtx(&si->si.si_note, m);
+}
+
+void
+nm_os_selinfo_uninit(NM_SELINFO_T *si)
+{
+	/* XXX kqueue(9) needed; these will mirror knlist_init. */
+	knlist_delete(&si->si.si_note, curthread, 0 /* not locked */ );
+	knlist_destroy(&si->si.si_note);
+	/* now we don't need the mutex anymore */
+	mtx_destroy(&si->m);
+}
+
 void
 nm_os_ifnet_lock(void)
 {
@@ -85,17 +101,42 @@ nm_os_ifnet_unlock(void)
 	IFNET_WUNLOCK();
 }
 
+static int netmap_use_count = 0;
+
+void
+nm_os_get_module(void)
+{
+	netmap_use_count++;
+}
+
+void
+nm_os_put_module(void)
+{
+	netmap_use_count--;
+}
+
+static void
+netmap_ifnet_arrival_handler(void *arg __unused, struct ifnet *ifp)
+{
+        netmap_undo_zombie(ifp);
+}
+
 static void
 netmap_ifnet_departure_handler(void *arg __unused, struct ifnet *ifp)
 {
         netmap_make_zombie(ifp);
 }
 
+static eventhandler_tag nm_ifnet_ah_tag;
 static eventhandler_tag nm_ifnet_dh_tag;
 
 int
 nm_os_ifnet_init(void)
 {
+        nm_ifnet_ah_tag =
+                EVENTHANDLER_REGISTER(ifnet_arrival_event,
+                        netmap_ifnet_arrival_handler,
+                        NULL, EVENTHANDLER_PRI_ANY);
         nm_ifnet_dh_tag =
                 EVENTHANDLER_REGISTER(ifnet_departure_event,
                         netmap_ifnet_departure_handler,
@@ -106,6 +147,8 @@ nm_os_ifnet_init(void)
 void
 nm_os_ifnet_fini(void)
 {
+        EVENTHANDLER_DEREGISTER(ifnet_arrival_event,
+                nm_ifnet_ah_tag);
         EVENTHANDLER_DEREGISTER(ifnet_departure_event,
                 nm_ifnet_dh_tag);
 }
@@ -195,6 +238,14 @@ nm_os_send_up(struct ifnet *ifp, struct mbuf *m, struct mbuf *prev)
 
 	NA(ifp)->if_input(ifp, m);
 	return NULL;
+}
+
+int
+nm_os_mbuf_has_offld(struct mbuf *m)
+{
+	return m->m_pkthdr.csum_flags & (CSUM_TCP | CSUM_UDP | CSUM_SCTP |
+					 CSUM_TCP_IPV6 | CSUM_UDP_IPV6 |
+					 CSUM_SCTP_IPV6 | CSUM_TSO);
 }
 
 static void
@@ -1463,3 +1514,6 @@ netmap_loader(__unused struct module *module, int event, __unused void *arg)
 
 DEV_MODULE(netmap, netmap_loader, NULL);
 MODULE_VERSION(netmap, 1);
+/* reduce conditional code */
+// linux API, use for the knlist in FreeBSD
+/* use a private mutex for the knlist */

@@ -239,7 +239,7 @@ static int netmap_monitor_parent_notify(struct netmap_kring *, int);
 static int
 netmap_monitor_add(struct netmap_kring *mkring, struct netmap_kring *kring, int zcopy)
 {
-	int error = 0;
+	int error = NM_IRQ_COMPLETED;
 
 	/* sinchronize with concurrently running nm_sync()s */
 	nm_kr_stop(kring, NM_KR_LOCKED);
@@ -252,7 +252,7 @@ netmap_monitor_add(struct netmap_kring *mkring, struct netmap_kring *kring, int 
 	kring->n_monitors++;
 	if (kring->n_monitors == 1) {
 		/* this is the first monitor, intercept callbacks */
-		D("%s: intercept callbacks on %s", mkring->name, kring->name);
+		ND("%s: intercept callbacks on %s", mkring->name, kring->name);
 		kring->mon_sync = kring->nm_sync;
 		/* zcopy monitors do not override nm_notify(), but
 		 * we save the original one regardless, so that
@@ -296,11 +296,11 @@ netmap_monitor_del(struct netmap_kring *mkring, struct netmap_kring *kring)
 	kring->monitors[kring->n_monitors] = NULL;
 	if (kring->n_monitors == 0) {
 		/* this was the last monitor, restore callbacks  and delete monitor array */
-		D("%s: restoring sync on %s: %p", mkring->name, kring->name, kring->mon_sync);
+		ND("%s: restoring sync on %s: %p", mkring->name, kring->name, kring->mon_sync);
 		kring->nm_sync = kring->mon_sync;
 		kring->mon_sync = NULL;
 		if (kring->tx == NR_RX) {
-			D("%s: restoring notify on %s: %p", 
+			ND("%s: restoring notify on %s: %p", 
 					mkring->name, kring->name, kring->mon_notify);
 			kring->nm_notify = kring->mon_notify;
 			kring->mon_notify = NULL;
@@ -671,21 +671,27 @@ netmap_monitor_parent_rxsync(struct netmap_kring *kring, int flags)
 static int
 netmap_monitor_parent_notify(struct netmap_kring *kring, int flags)
 {
-	int error = 0;
+	int (*notify)(struct netmap_kring*, int);
 	ND(5, "%s %x", kring->name, flags);
 	/* ?xsync callbacks have tryget called by their callers
 	 * (NIOCREGIF and poll()), but here we have to call it
 	 * by ourself
 	 */
-	if (nm_kr_tryget(kring, 0, &error)) {
+	if (nm_kr_tryget(kring, 0, NULL)) {
 		/* in all cases, just skip the sync */
-		goto out;
+		return NM_IRQ_COMPLETED;
 	}
-	netmap_monitor_parent_rxsync(kring, NAF_FORCE_READ);
-
+	if (kring->n_monitors > 0) {
+		netmap_monitor_parent_rxsync(kring, NAF_FORCE_READ);
+		notify = kring->mon_notify;
+	} else {
+		/* we are no longer monitoring this ring, so both
+		 * mon_sync and mon_notify are NULL
+		 */
+		notify = kring->nm_notify;
+	}
 	nm_kr_put(kring);
-out:
-        return (error ? EIO : kring->mon_notify(kring, flags));
+        return notify(kring, flags);
 }
 
 
@@ -721,12 +727,18 @@ netmap_get_monitor_na(struct nmreq *nmr, struct netmap_adapter **na, int create)
 	char monsuff[10] = "";
 
 	if ((nmr->nr_flags & (NR_MONITOR_TX | NR_MONITOR_RX)) == 0) {
+		if (nmr->nr_flags & NR_ZCOPY_MON) {
+			/* the flag makes no sense unless you are 
+			 * creating a monitor
+			 */
+			return EINVAL;
+		}
 		ND("not a monitor");
 		return 0;
 	}
 	/* this is a request for a monitor adapter */
 
-	D("flags %x", nmr->nr_flags);
+	ND("flags %x", nmr->nr_flags);
 
 	mna = malloc(sizeof(*mna), M_DEVBUF, M_NOWAIT | M_ZERO);
 	if (mna == NULL) {
@@ -746,7 +758,7 @@ netmap_get_monitor_na(struct nmreq *nmr, struct netmap_adapter **na, int create)
 		D("parent lookup failed: %d", error);
 		return error;
 	}
-	D("found parent: %s", pna->name);
+	ND("found parent: %s", pna->name);
 
 	if (!nm_netmap_on(pna)) {
 		/* parent not in netmap mode */
@@ -853,14 +865,8 @@ netmap_get_monitor_na(struct nmreq *nmr, struct netmap_adapter **na, int create)
 	*na = &mna->up;
 	netmap_adapter_get(*na);
 
-	/* write the configuration back */
-	nmr->nr_tx_rings = mna->up.num_tx_rings;
-	nmr->nr_rx_rings = mna->up.num_rx_rings;
-	nmr->nr_tx_slots = mna->up.num_tx_desc;
-	nmr->nr_rx_slots = mna->up.num_rx_desc;
-
 	/* keep the reference to the parent */
-	D("monitor ok");
+	ND("monitor ok");
 
 	/* drop the reference to the ifp, if any */
 	if (ifp)

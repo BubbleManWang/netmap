@@ -92,7 +92,7 @@ __FBSDID("$FreeBSD: head/sys/dev/netmap/netmap_generic.c 274353 2014-11-10 20:19
  *
  * We allocate EXT_PACKET mbuf+clusters, but need to set M_NOFREE
  * so that the destructor, if invoked, will not free the packet.
- *    In principle we should set the destructor only on demand,
+ * In principle we should set the destructor only on demand,
  * but since there might be a race we better do it on allocation.
  * As a consequence, we also need to set the destructor or we
  * would leak buffers.
@@ -131,8 +131,12 @@ nm_os_get_mbuf(struct ifnet *ifp, int len)
 	struct mbuf *m;
 
 	(void)ifp;
-	m = m_getcl(M_NOWAIT, MT_DATA, M_PKTHDR | M_NOFREE);
+	m = m_getcl(M_NOWAIT, MT_DATA, M_PKTHDR);
 	if (m) {
+		/* m_getcl() (mb_ctor_mbuf) has an assert that checks that
+		 * M_NOFREE flag is not specified as third argument,
+		 * so we have to set M_NOFREE after m_getcl(). */
+		m->m_flags |= M_NOFREE;
 		m->m_ext.ext_arg1 = m->m_ext.ext_buf; // XXX save
 		m->m_ext.ext_free = (void *)netmap_default_mbuf_destructor;
 		m->m_ext.ext_type = EXT_EXTREF;
@@ -159,6 +163,13 @@ nm_os_get_mbuf(struct ifnet *ifp, int len)
 #include <linux/ethtool.h>      /* struct ethtool_ops, get_ringparam */
 #include <linux/hrtimer.h>
 
+static inline struct mbuf *
+nm_os_get_mbuf(struct ifnet *ifp, int len)
+{
+	return alloc_skb(ifp->needed_headroom + len +
+			 ifp->needed_tailroom, GFP_ATOMIC);
+}
+
 #endif /* linux */
 
 
@@ -168,13 +179,18 @@ nm_os_get_mbuf(struct ifnet *ifp, int len)
 #include <dev/netmap/netmap_mem2.h>
 
 
-#define for_each_tx_kring(_i, _k, _na)					\
-	for (_k=&(_na)->tx_rings[0], _i = 0;				\
-	     _i < (_na)->num_tx_rings; (_k)++, (_i)++)
+#define for_each_kring_n(_i, _k, _karr, _n) \
+	for (_k=_karr, _i = 0; _i < _n; (_k)++, (_i)++)
 
-#define for_each_rx_kring(_i, _k, _na)					\
-	for (_k=&(_na)->rx_rings[0], _i = 0;				\
-	     _i < (_na)->num_rx_rings; (_k)++, (_i)++)
+#define for_each_tx_kring(_i, _k, _na) \
+            for_each_kring_n(_i, _k, (_na)->tx_rings, (_na)->num_tx_rings)
+#define for_each_tx_kring_h(_i, _k, _na) \
+            for_each_kring_n(_i, _k, (_na)->tx_rings, (_na)->num_tx_rings + 1)
+
+#define for_each_rx_kring(_i, _k, _na) \
+            for_each_kring_n(_i, _k, (_na)->rx_rings, (_na)->num_rx_rings)
+#define for_each_rx_kring_h(_i, _k, _na) \
+            for_each_kring_n(_i, _k, (_na)->rx_rings, (_na)->num_rx_rings + 1)
 
 
 /* ======================== PERFORMANCE STATISTICS =========================== */
@@ -286,18 +302,25 @@ generic_netmap_unregister(struct netmap_adapter *na)
 		rtnl_unlock();
 	}
 
-	for_each_rx_kring(r, kring, na) {
-		if (!nm_kring_pending_off(kring)) {
-			continue;
+	for_each_rx_kring_h(r, kring, na) {
+		if (nm_kring_pending_off(kring)) {
+			D("RX ring %d of generic adapter %p goes off", r, na);
+			kring->nr_mode = NKR_NETMAP_OFF;
 		}
+	}
+	for_each_tx_kring_h(r, kring, na) {
+		if (nm_kring_pending_off(kring)) {
+			kring->nr_mode = NKR_NETMAP_OFF;
+			D("TX ring %d of generic adapter %p goes off", r, na);
+		}
+	}
 
-		D("RX ring %d of generic adapter %p goes off", r, na);
+	for_each_rx_kring(r, kring, na) {
 		/* Free the mbufs still pending in the RX queues,
 		 * that did not end up into the corresponding netmap
 		 * RX rings. */
 		mbq_safe_purge(&kring->rx_queue);
 		nm_os_mitigation_cleanup(&gna->mit[r]);
-		kring->nr_mode = NKR_NETMAP_OFF;
 	}
 
 	/* Decrement reference counter for the mbufs in the
@@ -305,11 +328,6 @@ generic_netmap_unregister(struct netmap_adapter *na)
 	 * (e.g. this happens with virtio-net driver, which
 	 * does lazy reclaiming of transmitted mbufs). */
 	for_each_tx_kring(r, kring, na) {
-		if (!nm_kring_pending_off(kring)) {
-			continue;
-		}
-
-		D("TX ring %d of generic adapter %p goes off", r, na);
 		/* We must remove the destructor on the TX event,
 		 * because the destructor invokes netmap code, and
 		 * the netmap module may disappear before the
@@ -320,8 +338,6 @@ generic_netmap_unregister(struct netmap_adapter *na)
 		}
 		kring->tx_event = NULL;
 		mtx_unlock(&kring->tx_event_lock);
-
-		kring->nr_mode = NKR_NETMAP_OFF;
 	}
 
 	if (na->active_fds == 0) {
@@ -407,7 +423,6 @@ generic_netmap_register(struct netmap_adapter *na, int enable)
 		for_each_tx_kring(r, kring, na) {
 			kring->tx_pool = NULL;
 		}
-
 		for_each_tx_kring(r, kring, na) {
 			kring->tx_pool =
 				malloc(na->num_tx_desc * sizeof(struct mbuf *),
@@ -422,29 +437,27 @@ generic_netmap_register(struct netmap_adapter *na, int enable)
 		}
 	}
 
-	for_each_rx_kring(r, kring, na) {
-		if (!nm_kring_pending_on(kring)) {
-			continue;
+	for_each_rx_kring_h(r, kring, na) {
+		if (nm_kring_pending_on(kring)) {
+			D("RX ring %d of generic adapter %p goes on", r, na);
+			kring->nr_mode = NKR_NETMAP_ON;
 		}
 
-		D("RX ring %d of generic adapter %p goes on", r, na);
-		kring->nr_mode = NKR_NETMAP_ON;
+	}
+	for_each_tx_kring_h(r, kring, na) {
+		if (nm_kring_pending_on(kring)) {
+			D("TX ring %d of generic adapter %p goes on", r, na);
+			kring->nr_mode = NKR_NETMAP_ON;
+		}
 	}
 
 	for_each_tx_kring(r, kring, na) {
-		if (!nm_kring_pending_on(kring)) {
-			continue;
-		}
-
 		/* Initialize tx_pool and tx_event. */
-		D("TX ring %d of generic adapter %p goes on", r, na);
 		for (i=0; i<na->num_tx_desc; i++) {
 			kring->tx_pool[i] = NULL;
 		}
 
 		kring->tx_event = NULL;
-
-		kring->nr_mode = NKR_NETMAP_ON;
 	}
 
 	if (na->active_fds == 0) {
@@ -514,17 +527,13 @@ out:
 static void
 generic_mbuf_destructor(struct mbuf *m)
 {
-	struct netmap_adapter *na = NA(MBUF_IFP(m));
+	struct netmap_adapter *na = NA(GEN_TX_MBUF_IFP(m));
 	struct netmap_kring *kring;
 	unsigned int r = MBUF_TXQ(m);
 
 	if (unlikely(!nm_netmap_on(na) || r >= na->num_tx_rings)) {
-		/* Unfortunately, certain drivers (like the linux bridge
-		 * driver, or the linux veth driver) change the MBUF_IFP(m)
-		 * that was set by generic_xmit_frame, so that here we end
-		 * up with a NULL na, or a different na.
-		 */
-		RD(3, "Warning: driver modified MBUF_IFP(m)");
+		D("Error: no netmap adapter on device %p",
+		  GEN_TX_MBUF_IFP(m));
 		return;
 	}
 
@@ -901,7 +910,7 @@ generic_rx_handler(struct ifnet *ifp, struct mbuf *m)
 	}
 
 	/* limit the size of the queue */
-	if (unlikely(!gna->rxsg && MBUF_LEN(m) > kring->ring->nr_buf_size)) {
+	if (unlikely(!gna->rxsg && MBUF_LEN(m) > NETMAP_BUF_SIZE(na))) {
 		/* This may happen when GRO/LRO features are enabled for
 		 * the NIC driver when the generic adapter does not
 		 * support RX scatter-gather. */
@@ -953,7 +962,7 @@ generic_netmap_rxsync(struct netmap_kring *kring, int flags)
 
 	/* Adapter-specific variables. */
 	uint16_t slot_flags = kring->nkr_slot_flags;
-	u_int nm_buf_len = ring->nr_buf_size;
+	u_int nm_buf_len = NETMAP_BUF_SIZE(na);
 	struct mbq tmpq;
 	struct mbuf *m;
 	int avail; /* in bytes */
@@ -1180,7 +1189,7 @@ generic_netmap_attach(struct ifnet *ifp)
 
 	nm_os_generic_set_features(gna);
 
-	ND("Created generic NA %p (prev %p)", gna, gna->prev);
+	D("Created generic NA %p (prev %p)", gna, gna->prev);
 
 	return retval;
 }

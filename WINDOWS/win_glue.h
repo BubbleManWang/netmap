@@ -213,15 +213,15 @@ typedef struct _win_SELINFO
 } win_SELINFO;
 
 static void 
-win_initialize_waitqueue(win_SELINFO* queue)
+nm_os_selinfo_init(win_SELINFO* queue)
 {
 	KeInitializeEvent(&queue->queue, NotificationEvent, TRUE);
 	KeInitializeGuardedMutex(&queue->mutex);
 }
 
+static void nm_os_selinfo_uninit(win_SELINFO *queue) { /* XXX nothing to do here? */ }
+
 #define PI_NET					16
-#define init_waitqueue_head(x)			win_initialize_waitqueue(x);
-#define netmap_knlist_destroy(x)
 #define tsleep(ident, priority, wmesg, time)	KeDelayExecutionThread(KernelMode, FALSE, (PLARGE_INTEGER)time)	
 
 
@@ -304,8 +304,8 @@ typedef struct _FUNCTION_POINTER_XCHANGE {
 //XXX_ale To be correctly redefined
 #define MBUF_REFCNT(a)				1
 #define	SET_MBUF_DESTRUCTOR(a,b)		a->netmap_default_mbuf_destructor = b;// XXX must be set to enable tx notifications
-#define MBUF_IFP(m)				m->dev
 #define MBUF_QUEUED(m)				1
+#define GEN_TX_MBUF_IFP(m)				m->dev
 
 void win32_init_lookaside_buffers(struct net_device *ifp);
 void win32_clear_lookaside_buffers(struct net_device *ifp);

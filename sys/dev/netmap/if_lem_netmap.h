@@ -38,6 +38,9 @@
 #include <vm/vm.h>
 #include <vm/pmap.h>    /* vtophys ? */
 #include <dev/netmap/netmap_kern.h>
+#ifdef WITH_PTNETMAP_GUEST
+#include <dev/netmap/netmap_mem2.h>
+#endif
 #include <dev/netmap/netmap_virt.h>
 
 extern int netmap_adaptive_io;
@@ -529,14 +532,13 @@ lem_ptnetmap_txsync(struct netmap_kring *kring, int flags)
 	//u_int ring_nr = kring->ring_id;
 	struct ifnet *ifp = na->ifp;
 	struct adapter *adapter = ifp->if_softc;
-	int ret, notify = 0;
+	bool notify;
 
-	ret = netmap_pt_guest_txsync(kring, flags, &notify);
-
+	notify = netmap_pt_guest_txsync(&adapter->csb->tx_ring, kring, flags);
 	if (notify)
 		E1000_WRITE_REG(&adapter->hw, E1000_TDT(0), 0);
 
-	return ret;
+	return 0;
 }
 
 /* Reconcile host and guest view of the receive ring. */
@@ -547,14 +549,13 @@ lem_ptnetmap_rxsync(struct netmap_kring *kring, int flags)
 	//u_int ring_nr = kring->ring_id;
 	struct ifnet *ifp = na->ifp;
 	struct adapter *adapter = ifp->if_softc;
-	int ret, notify = 0;
+	bool notify;
 
-	ret = netmap_pt_guest_rxsync(kring, flags, &notify);
-
+	notify = netmap_pt_guest_rxsync(&adapter->csb->rx_ring, kring, flags);
 	if (notify)
 		E1000_WRITE_REG(&adapter->hw, E1000_RDT(0), 0);
 
-	return ret;
+	return 0;
 }
 
 /* Register/unregister. We are already under netmap lock. */
@@ -613,20 +614,6 @@ lem_ptnetmap_bdg_attach(const char *bdg_name, struct netmap_adapter *na)
 	return EOPNOTSUPP;
 }
 
-/*
- * CSB (Communication Status Block) setup
- * CSB is already allocated in if_lem (paravirt).
- */
-static void
-lem_ptnetmap_setup_csb(struct adapter *adapter)
-{
-	struct ifnet *ifp = adapter->ifp;
-	struct netmap_pt_guest_adapter* ptna =
-		(struct netmap_pt_guest_adapter *)NA(ifp);
-
-	ptna->csb = adapter->csb;
-}
-
 /* Send command to the host through PTCTL register. */
 static uint32_t
 lem_ptnetmap_ptctl(struct ifnet *ifp, uint32_t val)
@@ -656,10 +643,13 @@ lem_ptnetmap_features(struct adapter *adapter)
 	return features;
 }
 
-static struct netmap_pt_guest_ops lem_ptnetmap_ops = {
-	.nm_ptctl = lem_ptnetmap_ptctl,
-};
-/* XXX: these warning affect the proper kernel compilation
+static void
+lem_ptnetmap_dtor(struct netmap_adapter *na)
+{
+	netmap_mem_pt_guest_ifp_del(na->nm_mem, na->ifp);
+}
+
+/* XXX: these warning affect proper kernel compilation
 #elif defined (NIC_PTNETMAP)
 #warning "if_lem supports ptnetmap but netmap does not support it"
 #warning "(configure netmap with ptnetmap support)"
@@ -689,13 +679,26 @@ lem_netmap_attach(struct adapter *adapter)
         /* XXX: check if the device support ptnetmap (now we use PARA_SUBDEV) */
 	if ((adapter->hw.subsystem_device_id == E1000_PARA_SUBDEV) &&
 		(lem_ptnetmap_features(adapter) & NET_PTN_FEATURES_BASE)) {
+		int err;
+
 		na.nm_config = lem_ptnetmap_config;
 		na.nm_register = lem_ptnetmap_reg;
 		na.nm_txsync = lem_ptnetmap_txsync;
 		na.nm_rxsync = lem_ptnetmap_rxsync;
 		na.nm_bdg_attach = lem_ptnetmap_bdg_attach; /* XXX */
-		netmap_pt_guest_attach(&na, &lem_ptnetmap_ops);
-		lem_ptnetmap_setup_csb(adapter);
+		na.nm_dtor = lem_ptnetmap_dtor;
+
+		/* Ask the device to fill in some configuration fields. Here we
+		 * just need nifp_offset. */
+		err = lem_ptnetmap_ptctl(na.ifp, NET_PARAVIRT_PTCTL_CONFIG);
+		if (err) {
+			D("Failed to get nifp_offset from passthrough device");
+			return;
+		}
+
+		netmap_pt_guest_attach(&na, adapter->csb,
+				       adapter->csb->nifp_offset,
+				       lem_ptnetmap_ptctl);
 	} else
 #endif /* NIC_PTNETMAP && defined WITH_PTNETMAP_GUEST */
 		netmap_attach(&na);
